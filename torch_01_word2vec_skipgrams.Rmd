@@ -1,0 +1,312 @@
+---
+title: "torch_01_word2vec_skipgrams.Rmd"
+output: 
+    html_document:
+        df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load Packages
+
+If you don't have the following packages, they can be installed with this code:
+
+```{r, eval=FALSE}
+install.packages("tidytext")
+install.packages("tidyverse")
+install.packages("torch")
+install.packages("knitr")
+install.packages("quanteda")
+```
+
+Load the packages:
+
+```{r}
+library(tidytext)
+library(tidyverse)
+library(torch)
+library(knitr)
+library(quanteda)
+library(magrittr)
+```
+
+## Parameters
+
+The default value of the subsampling parameter `t_` is `10e-5` per the paper.
+We can also filter on a minimum word count here, `mwc_`.
+For this dataset, `mwc_ = 1` inidicates no minimum word count.
+The window parameter is `W_`, which is set to `7` just for the test data.
+The parameter `nse_` is the negative sampling exponent, used to influence the token distribution for negative sampling.
+The paper recommends `3/4` by default. 
+`lr_`, `bat_size_`, `n_epoch_` are training parameters.
+`vec_size_` is the word vector size.
+`seed_` is just for random number generation in R, used a few times. 
+
+```{r}
+t_ <- 10e-5
+mwc_ <- 1
+W_ <- 7
+nse_ <- 3/4
+n_epoch_ <- 10
+bat_size_ <- 500
+lr_ <- 0.005
+vec_size_ <- 50
+seed_ <- 1234
+```
+
+
+## Construct Positive Samples
+
+First, we need to generate our training data. 
+
+First, load the raw text data.
+
+```{r}
+pnp <- read_file("data_in/pride_and_prejudice.txt")
+cat(substr(pnp, 1, 1000), fill = TRUE)
+```
+
+Tokenize the data by sentences and words. 
+Remove underscores, which indicates italics in the text. 
+
+```{r}
+data.frame(text = pnp) %>%
+    unnest_sentences("sent", "text") %>%
+    mutate(sent_id = seq(sent)) %>%
+    unnest_tokens("tok", "sent") %>%
+    mutate(tok = str_replace_all(tok, "_", ""), tok_id = seq(tok)) ->
+    x1_tokens
+
+x1_tokens
+```
+
+Implement the subsampling scheme from the Word2Vec paper. 
+
+```{r}
+set.seed(seed_)
+
+x1_tokens %>%
+    count(tok) %>%
+    arrange(tok) %>%
+    filter(n >= mwc_) %>%
+    transmute(tok, z = n/sum(n), P = 1 - sqrt(t_/z)) ->
+    vocab
+
+x1_tokens %>%
+    inner_join(vocab, by = "tok") %>%
+    mutate(r = runif(length(P))) %>%
+    filter(P < r) ->
+    x2_samp_tokens
+
+x2_samp_tokens
+```
+
+Get the positive samples using the skipgram method.
+
+```{r}
+split(x2_samp_tokens$tok, x2_samp_tokens$sent_id) %>%
+    as.tokens() %>%
+    tokens_ngrams(2, 1:W_) %>%
+    as.character %>%
+    str_split_fixed("_", 2) %>%
+    as.data.frame %>%
+    setNames(c("tok_1", "tok_2")) ->
+    x3_skipgrams
+
+x3_skipgrams
+```
+
+
+## Create The Dataloader
+
+The dataloader does one hot encoding up front, and also handles negative sampling.
+For now, there will be one negative sample for each positive sample.
+
+```{r}
+w2v_data <- dataset(
+    "w2v_data",
+    
+    initialize = function(X, vocab, nse = 3/4) {
+        # set up parameters
+        self$X <- X
+        self$N <- nrow(X)
+        self$vocab <- vocab
+        self$v <- vocab$tok
+        self$vocab_size <- length(self$v)
+        self$nse <- nse
+        self$V <- torch_diag(rep(1, self$vocab_size))
+        
+        # encode all input words
+        Map <- data.frame(tok = self$v, id = seq(self$v))
+        X %>%
+            inner_join(rename(Map, tok_1 = tok, id_1 = id), by = c("tok_1")) %>%
+            inner_join(rename(Map, tok_2 = tok, id_2 = id), by = c("tok_2")) ->
+            X_m
+        self$id_1 <- X_m$id_1
+        self$id_2 <- X_m$id_2
+        
+        # do prep for negative samples
+        vocab %>%
+            inner_join(Map, by = "tok") %>%
+            transmute(id, z, P = z^nse/(sum(z^nse))) %>%
+            mutate(cnt = floor(2*P/min(P))) %$%
+            map2(id, cnt, rep) %>%
+            unlist ->
+            neg_vocab
+        self$neg_vocab <- neg_vocab
+        
+    },
+    
+    .getitem = function(i) {
+        # get positive samples
+        p_1 <- self$id_1[i]
+        p_2 <- self$id_2[i]
+        x_1 <- self$V[p_1,]
+        
+        # generate negative sample
+        p_n <- sample(self$neg_vocab, 1)
+        
+        list(p_1 = p_1, p_2 = p_2, p_n = p_n, x_1 = x_1)
+    },
+    
+    .length = function() {
+        self$N
+    }
+)
+```
+
+## Create the Word2Vec Model
+
+Define the model architecture.
+
+```{r}
+word2vec <- nn_module(
+    initialize = function(vocab, vec_size = 50) {
+        self$vocab <- vocab
+        self$vec_size <- vec_size
+        self$v <- vocab$tok
+        self$fc1 <- nn_linear(in_features = length(self$v), out_features = vec_size, bias = FALSE)
+        self$fc2 <- nn_linear(in_features = vec_size, out_features = length(self$v), bias = FALSE)
+    },
+    
+    forward = function(x) {
+        x %>%
+            self$fc1() %>%
+            nnf_sigmoid() %>%
+            self$fc2()
+    },
+    
+    word_vec = function(i) {
+        self$fc1$weight[,i]
+    },
+    
+    context_vec = function(i) {
+        self$fc2$weight[i,]
+    },
+    
+    vector = function(word, vocab) {
+        x <- torch_zeros(length(vocab))
+        i <- which(word == vocab)
+        x[i] <- 1
+        self$fc1(x)
+    },
+    
+    get_word_distances = function(word) {
+        pos <- which(self$v == word)
+        x1 <- self$word_vec(pos)
+        L <- lapply(seq(self$v), function(i) {
+            x2 <- self$word_vec(i)
+            as.numeric(torch_cosine_similarity(x1, x2, 1))
+        })
+        data.frame(
+            token = data_1$vocab$tok,
+            cosine_similarity = unlist(L)
+        )
+    }
+)
+```
+
+
+## Set Up The Optimizer
+
+Need to use a custom loss function for skipgrams with negative sampling:
+
+```{r}
+# vt is the V x B batch of embedding vectors
+# vp is the B x V batch of context vectors for positive samples
+# vn is the B x V batch of context vectors for negative samples
+
+loss_skipgram <- function(vt, vp, vn) {
+    vt_t <- vt$transpose(2,1)
+    loss_pos <- nnf_logsigmoid(torch_sum(torch_mul(vt_t, vp), 2))
+    loss_neg <- nnf_logsigmoid(torch_sum(-1 * torch_mul(vt_t, vn), 2))
+    loss <- -1 * (loss_pos + loss_neg)
+    torch_mean(loss)
+}
+```
+
+Create an optimizer and batch training function
+
+```{r}
+train_batch <- function(b) {
+    # gradient reset required
+    opt$zero_grad()
+    
+    # feed forward and calculate loss
+    ffw <- word2vec_1$forward(b$x_1)
+    vt <- word2vec_1$word_vec(b$p_1)
+    vp <- word2vec_1$context_vec(b$p_2)
+    vn <- word2vec_1$context_vec(b$p_n)
+    loss <- loss_skipgram(vt, vp, vn)
+    
+    # backprop step
+    loss$backward()
+    opt$step()
+    loss
+}
+```
+
+## Train the Model
+
+Initialize data, dataloader, and model objects.
+
+The dataloader randomly pulls `bat_size_` samples from the data per batch.
+
+```{r}
+word2vec_1 <- word2vec(vocab, vec_size_)
+data_1 <- w2v_data(x3_skipgrams, vocab, nse_)
+dl_1 <- dataloader(data_1, batch_size = bat_size_, shuffle = TRUE)
+opt <- optim_adam(word2vec_1$parameters, lr = lr_)
+```
+
+Train the model
+
+```{r}
+set.seed(seed_ + 1)
+tr_l <- length(dl_1)
+n_epoch <- n_epoch_
+for (ep in 1:n_epoch) {
+    # this needs to be called
+    word2vec_1$train()
+    
+    train_losses <- c()
+    iter <- dataloader_make_iter(dl_1)
+    for (k in 1:tr_l) {
+        b <- dataloader_next(iter)
+        loss <- train_batch(b)
+        train_losses <- c(train_losses, as.numeric(loss))
+    }
+    print(sprintf("Epoch %s, Mean loss %s", ep, round(mean(train_losses), 3)))
+    
+}
+```
+
+## Analyze the Results
+
+```{r}
+word2vec_1$get_word_distances("man") %>% arrange(desc(cosine_similarity))
+word2vec_1$get_word_distances("woman") %>% arrange(desc(cosine_similarity))
+```
+
